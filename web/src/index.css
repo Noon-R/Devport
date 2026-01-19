@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+/* Base styles */
+body {
+  @apply bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100;
+  margin: 0;
+  min-height: 100vh;
+}
+
+#root {
+  @apply min-h-screen;
+}
