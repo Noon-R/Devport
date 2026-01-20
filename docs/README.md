@@ -8,8 +8,7 @@ Devport は「AI 編集をメイン、手動編集をサブ」というコンセ
 
 | ドキュメント | 説明 |
 |-------------|------|
-| [アーキテクチャ概要](./architecture.md) | 技術スタック、システム構成、通信フロー |
-| [開発環境構築ガイド](./setup-guide.md) | 前提条件、ビルド・起動手順、OS別対応 |
+| [アーキテクチャ概要](./architecture.md) | 技術スタック| 
 | [JSON-RPC API リファレンス](./api-reference.md) | 全メソッド一覧、リクエスト/レスポンス例 |
 | [デプロイガイド](./deployment.md) | Docker / ネイティブビルド、環境変数 |
 
@@ -27,8 +26,3 @@ Devport は「AI 編集をメイン、手動編集をサブ」というコンセ
 |-------------|------|
 | [学習リソース](./learning-resources.md) | 実装に必要な知識と参考リンク集 |
 | [実装計画](./implementation-plan.md) | フェーズ別タスク、タイムライン、VPS構成 |
-
-## クイックリンク
-
-- **リポジトリ**: [github.com/sijiaoh/devport](https://github.com/sijiaoh/devport)
-- **公式サイト**: [devport.app](https://devport.app)
