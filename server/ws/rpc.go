@@ -4,8 +4,9 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"log"
 
-	"github.com/google/uuid"
+	"github.com/Noon-R/Devport/server/agent"
 )
 
 // JSON-RPC 2.0 structures
@@ -37,13 +38,13 @@ type JSONRPCError struct {
 
 // Error codes
 const (
-	ErrCodeParseError     = -32700
-	ErrCodeInvalidRequest = -32600
-	ErrCodeMethodNotFound = -32601
-	ErrCodeInvalidParams  = -32602
-	ErrCodeInternal       = -32603
-	ErrCodeAuthFailed     = -32001
-	ErrCodeUnauthorized   = -32002
+	ErrCodeParseError      = -32700
+	ErrCodeInvalidRequest  = -32600
+	ErrCodeMethodNotFound  = -32601
+	ErrCodeInvalidParams   = -32602
+	ErrCodeInternal        = -32603
+	ErrCodeAuthFailed      = -32001
+	ErrCodeUnauthorized    = -32002
 	ErrCodeSessionNotFound = -32003
 )
 
@@ -64,6 +65,12 @@ func (h *Handler) handleRequest(ctx context.Context, state *ConnState, req *JSON
 		return h.handleChatAttach(ctx, state, req)
 	case "chat.message":
 		return h.handleChatMessage(ctx, state, req)
+	case "chat.interrupt":
+		return h.handleChatInterrupt(ctx, state, req)
+	case "chat.permission_response":
+		return h.handlePermissionResponse(ctx, state, req)
+	case "chat.question_response":
+		return h.handleQuestionResponse(ctx, state, req)
 	default:
 		return errorResponse(req.ID, ErrCodeMethodNotFound, "Method not found: "+req.Method)
 	}
@@ -89,9 +96,9 @@ func (h *Handler) handleAuth(ctx context.Context, state *ConnState, req *JSONRPC
 
 // handleSessionList returns the list of sessions
 func (h *Handler) handleSessionList(ctx context.Context, state *ConnState, req *JSONRPCRequest) *JSONRPCResponse {
-	// TODO: Implement session store
+	sessions := h.sessionStore.List()
 	return successResponse(req.ID, map[string]interface{}{
-		"sessions": []interface{}{},
+		"sessions": sessions,
 	})
 }
 
@@ -106,13 +113,9 @@ func (h *Handler) handleSessionCreate(ctx context.Context, state *ConnState, req
 		params.Title = "New Chat"
 	}
 
-	// TODO: Implement session store
-	sessionID := "session_" + generateID()
+	session := h.sessionStore.Create(params.Title)
 	return successResponse(req.ID, map[string]interface{}{
-		"session": map[string]interface{}{
-			"id":    sessionID,
-			"title": params.Title,
-		},
+		"session": session,
 	})
 }
 
@@ -123,6 +126,12 @@ func (h *Handler) handleChatAttach(ctx context.Context, state *ConnState, req *J
 	}
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return errorResponse(req.ID, ErrCodeInvalidParams, "Invalid params")
+	}
+
+	// Get or create agent for this session
+	_, err := h.processManager.GetOrCreate(ctx, params.SessionID)
+	if err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
 	}
 
 	state.sessionID = params.SessionID
@@ -142,19 +151,151 @@ func (h *Handler) handleChatMessage(ctx context.Context, state *ConnState, req *
 		return errorResponse(req.ID, ErrCodeInvalidParams, "Invalid params")
 	}
 
-	// TODO: Implement Claude CLI integration
-	// For now, echo back the message
+	// Get agent for this session
+	ag, err := h.processManager.GetOrCreate(ctx, params.SessionID)
+	if err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
+	}
+
+	// Send message and stream events
 	go func() {
-		h.SendNotification(ctx, state, "chat.text", map[string]interface{}{
-			"session_id": params.SessionID,
-			"content":    "Echo: " + params.Content,
-		})
-		h.SendNotification(ctx, state, "chat.done", map[string]interface{}{
-			"session_id": params.SessionID,
-		})
+		events, err := ag.SendMessage(ctx, params.Content)
+		if err != nil {
+			log.Printf("SendMessage error: %v", err)
+			h.SendNotification(ctx, state, "chat.error", map[string]interface{}{
+				"session_id": params.SessionID,
+				"error":      err.Error(),
+			})
+			return
+		}
+
+		for event := range events {
+			h.sendEventNotification(ctx, state, params.SessionID, &event)
+		}
 	}()
 
 	return successResponse(req.ID, map[string]bool{"accepted": true})
+}
+
+// handleChatInterrupt handles interrupt request
+func (h *Handler) handleChatInterrupt(ctx context.Context, state *ConnState, req *JSONRPCRequest) *JSONRPCResponse {
+	var params struct {
+		SessionID string `json:"session_id"`
+	}
+	json.Unmarshal(req.Params, &params)
+
+	ag, err := h.processManager.GetOrCreate(ctx, params.SessionID)
+	if err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
+	}
+
+	if err := ag.Interrupt(ctx); err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
+	}
+
+	return successResponse(req.ID, map[string]bool{"success": true})
+}
+
+// handlePermissionResponse handles permission response from user
+func (h *Handler) handlePermissionResponse(ctx context.Context, state *ConnState, req *JSONRPCRequest) *JSONRPCResponse {
+	var params struct {
+		SessionID    string `json:"session_id"`
+		PermissionID string `json:"permission_id"`
+		Allowed      bool   `json:"allowed"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return errorResponse(req.ID, ErrCodeInvalidParams, "Invalid params")
+	}
+
+	ag, err := h.processManager.GetOrCreate(ctx, params.SessionID)
+	if err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
+	}
+
+	if err := ag.RespondToPermission(ctx, params.PermissionID, params.Allowed); err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
+	}
+
+	return successResponse(req.ID, map[string]bool{"success": true})
+}
+
+// handleQuestionResponse handles question response from user
+func (h *Handler) handleQuestionResponse(ctx context.Context, state *ConnState, req *JSONRPCRequest) *JSONRPCResponse {
+	var params struct {
+		SessionID  string `json:"session_id"`
+		QuestionID string `json:"question_id"`
+		Answer     string `json:"answer"`
+	}
+	if err := json.Unmarshal(req.Params, &params); err != nil {
+		return errorResponse(req.ID, ErrCodeInvalidParams, "Invalid params")
+	}
+
+	ag, err := h.processManager.GetOrCreate(ctx, params.SessionID)
+	if err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
+	}
+
+	if err := ag.RespondToQuestion(ctx, params.QuestionID, params.Answer); err != nil {
+		return errorResponse(req.ID, ErrCodeInternal, err.Error())
+	}
+
+	return successResponse(req.ID, map[string]bool{"success": true})
+}
+
+// sendEventNotification sends an event as a JSON-RPC notification
+func (h *Handler) sendEventNotification(ctx context.Context, state *ConnState, sessionID string, event *agent.Event) {
+	var method string
+	params := map[string]interface{}{
+		"session_id": sessionID,
+	}
+
+	switch event.Type {
+	case agent.EventTypeText:
+		method = "chat.text"
+		params["content"] = event.Content
+
+	case agent.EventTypeToolCall:
+		method = "chat.tool_call"
+		params["tool_use_id"] = event.ToolUseID
+		params["tool_name"] = event.ToolName
+		params["input"] = event.ToolInput
+
+	case agent.EventTypeToolResult:
+		method = "chat.tool_result"
+		params["tool_use_id"] = event.ToolUseID
+		params["output"] = event.ToolOutput
+
+	case agent.EventTypePermissionRequest:
+		method = "chat.permission_request"
+		params["permission_id"] = event.PermissionID
+		params["tool_name"] = event.ToolName
+		params["description"] = event.Content
+
+	case agent.EventTypeAskUserQuestion:
+		method = "chat.ask_user_question"
+		params["question_id"] = event.QuestionID
+		params["question"] = event.Question
+		params["options"] = event.Options
+
+	case agent.EventTypeDone:
+		method = "chat.done"
+
+	case agent.EventTypeError:
+		method = "chat.error"
+		params["error"] = event.Error
+
+	case agent.EventTypeSystem:
+		method = "chat.system"
+		params["message"] = event.Content
+
+	case agent.EventTypeInterrupted:
+		method = "chat.interrupted"
+
+	default:
+		return
+	}
+
+	h.SendNotification(ctx, state, method, params)
 }
 
 // Helper functions
@@ -175,8 +316,4 @@ func errorResponse(id interface{}, code int, message string) *JSONRPCResponse {
 		},
 		ID: id,
 	}
-}
-
-func generateID() string {
-	return uuid.New().String()[:8]
 }

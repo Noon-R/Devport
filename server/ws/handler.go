@@ -5,15 +5,20 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/Noon-R/Devport/server/config"
+	"github.com/Noon-R/Devport/server/process"
+	"github.com/Noon-R/Devport/server/session"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 )
 
 type Handler struct {
-	cfg   *config.Config
-	conns sync.Map // map[string]*ConnState
+	cfg            *config.Config
+	sessionStore   *session.Store
+	processManager *process.Manager
+	conns          sync.Map // map[string]*ConnState
 }
 
 type ConnState struct {
@@ -25,7 +30,9 @@ type ConnState struct {
 
 func NewHandler(cfg *config.Config) *Handler {
 	return &Handler{
-		cfg: cfg,
+		cfg:            cfg,
+		sessionStore:   session.NewStore(cfg.WorkDir),
+		processManager: process.NewManager(cfg.WorkDir, 10*time.Minute),
 	}
 }
 
@@ -55,6 +62,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WebSocket closed: %v", websocket.CloseStatus(err))
 			} else {
 				log.Printf("Read error: %v", err)
+			}
+			// Release process reference if attached
+			if state.sessionID != "" {
+				h.processManager.Release(state.sessionID)
 			}
 			return
 		}
