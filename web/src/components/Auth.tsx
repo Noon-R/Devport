@@ -1,4 +1,5 @@
 import { type FormEvent, useState } from "react";
+import { useFileStore } from "../lib/fileStore";
 import { useWsStore } from "../lib/wsStore";
 
 export function Auth() {
@@ -7,6 +8,7 @@ export function Auth() {
 	const [isConnecting, setIsConnecting] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const connect = useWsStore((s) => s.connect);
+	const setFileConnection = useFileStore((s) => s.setConnection);
 
 	const handleSubmit = async (e: FormEvent) => {
 		e.preventDefault();
@@ -15,6 +17,8 @@ export function Auth() {
 
 		try {
 			await connect(url, token);
+			// Set connection info for file store
+			setFileConnection(url, token);
 		} catch (err) {
 			setError((err as Error).message);
 		} finally {

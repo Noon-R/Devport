@@ -15,6 +15,23 @@ export interface ToolCall {
 	status: "pending" | "completed" | "error";
 }
 
+// History message from server
+export interface HistoryMessage {
+	id: string;
+	role: "user" | "assistant" | "system";
+	content: string;
+	tool_calls?: HistoryToolCall[];
+	timestamp: string;
+}
+
+export interface HistoryToolCall {
+	id: string;
+	name: string;
+	input?: Record<string, unknown>;
+	output?: string;
+	status: string;
+}
+
 // Session types
 export interface Session {
 	id: string;

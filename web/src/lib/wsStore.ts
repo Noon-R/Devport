@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type {
 	ConnectionState,
+	HistoryMessage,
 	Message,
 	PermissionRequest,
 	Session,
@@ -13,6 +14,10 @@ interface WsState {
 	connectionState: ConnectionState;
 	error: string | null;
 
+	// Connection info (for reconnect)
+	wsUrl: string | null;
+	authToken: string | null;
+
 	// Session
 	currentSessionId: string | null;
 	sessions: Session[];
@@ -20,6 +25,7 @@ interface WsState {
 	// Messages
 	messages: Message[];
 	isGenerating: boolean;
+	lastMessageId: string | null;
 
 	// Pending interactions
 	pendingPermission: PermissionRequest | null;
@@ -36,9 +42,14 @@ interface WsState {
 	respondToPermission: (allowed: boolean) => Promise<void>;
 	respondToQuestion: (answer: string) => Promise<void>;
 	clearError: () => void;
+	syncMessages: () => Promise<void>;
 }
 
 let ws: WebSocket | null = null;
+let reconnectAttempts = 0;
+let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const BASE_RECONNECT_DELAY = 1000;
 
 export const useWsStore = create<WsState>((set, get) => {
 	let currentAssistantMessage: Message | null = null;
@@ -47,6 +58,33 @@ export const useWsStore = create<WsState>((set, get) => {
 		number,
 		{ resolve: (value: unknown) => void; reject: (error: Error) => void }
 	>();
+
+	// Get HTTP base URL from WebSocket URL
+	const getHttpUrl = (): string => {
+		const { wsUrl } = get();
+		if (!wsUrl) return "";
+		return wsUrl
+			.replace("ws://", "http://")
+			.replace("wss://", "https://")
+			.replace("/ws", "");
+	};
+
+	// Fetch wrapper with auth
+	const apiFetch = async (
+		endpoint: string,
+		options?: RequestInit,
+	): Promise<Response> => {
+		const { authToken } = get();
+		const url = `${getHttpUrl()}${endpoint}`;
+		return fetch(url, {
+			...options,
+			headers: {
+				Authorization: `Bearer ${authToken}`,
+				"Content-Type": "application/json",
+				...options?.headers,
+			},
+		});
+	};
 
 	// Handle notifications from server
 	const handleNotification = (
@@ -152,8 +190,9 @@ export const useWsStore = create<WsState>((set, get) => {
 			}
 
 			case "chat.done": {
+				const msgId = currentAssistantMessage?.id || null;
 				currentAssistantMessage = null;
-				set({ isGenerating: false });
+				set({ isGenerating: false, lastMessageId: msgId });
 				break;
 			}
 
@@ -210,18 +249,64 @@ export const useWsStore = create<WsState>((set, get) => {
 		});
 	};
 
+	// Attempt reconnection
+	const attemptReconnect = () => {
+		const { wsUrl, authToken, currentSessionId } = get();
+		if (!wsUrl || !authToken) return;
+
+		if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+			set({ error: "Failed to reconnect after multiple attempts" });
+			return;
+		}
+
+		const delay = Math.min(
+			BASE_RECONNECT_DELAY * 2 ** reconnectAttempts,
+			30000,
+		);
+		reconnectAttempts++;
+
+		reconnectTimeout = setTimeout(async () => {
+			try {
+				await get().connect(wsUrl, authToken);
+				// Reattach to session if we had one
+				if (currentSessionId) {
+					await get().attachSession(currentSessionId);
+					// Sync any missing messages
+					await get().syncMessages();
+				}
+				reconnectAttempts = 0;
+			} catch {
+				attemptReconnect();
+			}
+		}, delay);
+	};
+
 	return {
 		connectionState: "disconnected",
 		error: null,
+		wsUrl: null,
+		authToken: null,
 		currentSessionId: null,
 		sessions: [],
 		messages: [],
 		isGenerating: false,
+		lastMessageId: null,
 		pendingPermission: null,
 		pendingQuestion: null,
 
 		connect: async (url: string, token: string) => {
-			set({ connectionState: "connecting", error: null });
+			// Clear any pending reconnect
+			if (reconnectTimeout) {
+				clearTimeout(reconnectTimeout);
+				reconnectTimeout = null;
+			}
+
+			set({
+				connectionState: "connecting",
+				error: null,
+				wsUrl: url,
+				authToken: token,
+			});
 
 			return new Promise((resolve, reject) => {
 				ws = new WebSocket(url);
@@ -232,6 +317,7 @@ export const useWsStore = create<WsState>((set, get) => {
 					try {
 						await sendRpcRequest("auth", { token });
 						set({ connectionState: "authenticated" });
+						reconnectAttempts = 0;
 						resolve();
 					} catch (e) {
 						set({
@@ -265,8 +351,14 @@ export const useWsStore = create<WsState>((set, get) => {
 				};
 
 				ws.onclose = () => {
+					const wasAuthenticated = get().connectionState === "authenticated";
 					set({ connectionState: "disconnected" });
 					pendingRequests.clear();
+
+					// Attempt reconnect if we were connected
+					if (wasAuthenticated) {
+						attemptReconnect();
+					}
 				};
 
 				ws.onerror = () => {
@@ -280,12 +372,21 @@ export const useWsStore = create<WsState>((set, get) => {
 		},
 
 		disconnect: () => {
+			// Clear any pending reconnect
+			if (reconnectTimeout) {
+				clearTimeout(reconnectTimeout);
+				reconnectTimeout = null;
+			}
+			reconnectAttempts = MAX_RECONNECT_ATTEMPTS; // Prevent auto-reconnect
+
 			ws?.close();
 			ws = null;
 			set({
 				connectionState: "disconnected",
 				currentSessionId: null,
 				messages: [],
+				wsUrl: null,
+				authToken: null,
 			});
 		},
 
@@ -306,10 +407,25 @@ export const useWsStore = create<WsState>((set, get) => {
 			}));
 
 			try {
-				await sendRpcRequest("chat.message", {
-					session_id: currentSessionId,
-					content,
-				});
+				// Try WebSocket first
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					await sendRpcRequest("chat.message", {
+						session_id: currentSessionId,
+						content,
+					});
+				} else {
+					// Fallback to REST API
+					const response = await apiFetch(
+						`/api/sessions/${currentSessionId}/messages`,
+						{
+							method: "POST",
+							body: JSON.stringify({ content }),
+						},
+					);
+					if (!response.ok) {
+						throw new Error("Failed to send message");
+					}
+				}
 			} catch (e) {
 				set({
 					isGenerating: false,
@@ -323,9 +439,17 @@ export const useWsStore = create<WsState>((set, get) => {
 			if (!currentSessionId) return;
 
 			try {
-				await sendRpcRequest("chat.interrupt", {
-					session_id: currentSessionId,
-				});
+				// Try WebSocket first
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					await sendRpcRequest("chat.interrupt", {
+						session_id: currentSessionId,
+					});
+				} else {
+					// Fallback to REST API
+					await apiFetch(`/api/sessions/${currentSessionId}/cancel`, {
+						method: "POST",
+					});
+				}
 			} catch (e) {
 				set({ error: (e as Error).message });
 			}
@@ -333,10 +457,36 @@ export const useWsStore = create<WsState>((set, get) => {
 
 		attachSession: async (sessionId: string) => {
 			try {
-				await sendRpcRequest("chat.attach", { session_id: sessionId });
+				const result = (await sendRpcRequest("chat.attach", {
+					session_id: sessionId,
+				})) as {
+					session_id: string;
+					status: string;
+					history: HistoryMessage[];
+				};
+
+				// Convert history messages to local Message format
+				const messages: Message[] = (result.history || []).map((hm) => ({
+					id: hm.id,
+					role: hm.role,
+					content: hm.content,
+					toolCalls: hm.tool_calls?.map((tc) => ({
+						id: tc.id,
+						name: tc.name,
+						input: tc.input,
+						output: tc.output,
+						status: tc.status as "pending" | "completed" | "error",
+					})),
+					timestamp: new Date(hm.timestamp),
+				}));
+
+				const lastId =
+					messages.length > 0 ? messages[messages.length - 1].id : null;
+
 				set({
 					currentSessionId: sessionId,
-					messages: [],
+					messages,
+					lastMessageId: lastId,
 					pendingPermission: null,
 					pendingQuestion: null,
 				});
@@ -372,11 +522,23 @@ export const useWsStore = create<WsState>((set, get) => {
 			if (!currentSessionId || !pendingPermission) return;
 
 			try {
-				await sendRpcRequest("chat.permission_response", {
-					session_id: currentSessionId,
-					permission_id: pendingPermission.permissionId,
-					allowed,
-				});
+				// Try WebSocket first
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					await sendRpcRequest("chat.permission_response", {
+						session_id: currentSessionId,
+						permission_id: pendingPermission.permissionId,
+						allowed,
+					});
+				} else {
+					// Fallback to REST API
+					await apiFetch(`/api/permissions/${pendingPermission.permissionId}`, {
+						method: "POST",
+						body: JSON.stringify({
+							session_id: currentSessionId,
+							allowed,
+						}),
+					});
+				}
 				set({ pendingPermission: null });
 			} catch (e) {
 				set({ error: (e as Error).message });
@@ -388,14 +550,68 @@ export const useWsStore = create<WsState>((set, get) => {
 			if (!currentSessionId || !pendingQuestion) return;
 
 			try {
-				await sendRpcRequest("chat.question_response", {
-					session_id: currentSessionId,
-					question_id: pendingQuestion.questionId,
-					answer,
-				});
+				// Try WebSocket first
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					await sendRpcRequest("chat.question_response", {
+						session_id: currentSessionId,
+						question_id: pendingQuestion.questionId,
+						answer,
+					});
+				} else {
+					// Fallback to REST API
+					await apiFetch(`/api/questions/${pendingQuestion.questionId}`, {
+						method: "POST",
+						body: JSON.stringify({
+							session_id: currentSessionId,
+							answer,
+						}),
+					});
+				}
 				set({ pendingQuestion: null });
 			} catch (e) {
 				set({ error: (e as Error).message });
+			}
+		},
+
+		// Sync messages after reconnection
+		syncMessages: async () => {
+			const { currentSessionId, lastMessageId } = get();
+			if (!currentSessionId) return;
+
+			try {
+				let url = `/api/sessions/${currentSessionId}/messages`;
+				if (lastMessageId) {
+					url += `?after=${lastMessageId}`;
+				}
+
+				const response = await apiFetch(url);
+				if (!response.ok) return;
+
+				const data = await response.json();
+				const newMessages: Message[] = (data.messages || []).map(
+					(hm: HistoryMessage) => ({
+						id: hm.id,
+						role: hm.role,
+						content: hm.content,
+						toolCalls: hm.tool_calls?.map((tc) => ({
+							id: tc.id,
+							name: tc.name,
+							input: tc.input,
+							output: tc.output,
+							status: tc.status as "pending" | "completed" | "error",
+						})),
+						timestamp: new Date(hm.timestamp),
+					}),
+				);
+
+				if (newMessages.length > 0) {
+					set((state) => ({
+						messages: [...state.messages, ...newMessages],
+						lastMessageId: newMessages[newMessages.length - 1].id,
+					}));
+				}
+			} catch {
+				// Silently fail sync
 			}
 		},
 

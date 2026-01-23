@@ -1,8 +1,11 @@
 import { useState } from "react";
 import { Auth } from "./components/Auth";
 import { ChatPanel } from "./components/Chat";
+import { FileBrowser } from "./components/File/FileBrowser";
+import { GitDiffViewer } from "./components/File/GitDiffViewer";
 import { SessionSidebar } from "./components/Session";
 import { PermissionDialog, QuestionDialog } from "./components/ui";
+import { useFileStore } from "./lib/fileStore";
 import { useWsStore } from "./lib/wsStore";
 
 function App() {
@@ -11,6 +14,11 @@ function App() {
 	const clearError = useWsStore((s) => s.clearError);
 	const currentSessionId = useWsStore((s) => s.currentSessionId);
 	const [sidebarOpen, setSidebarOpen] = useState(false);
+
+	const showFileBrowser = useFileStore((s) => s.showFileBrowser);
+	const showGitDiff = useFileStore((s) => s.showGitDiff);
+	const setShowFileBrowser = useFileStore((s) => s.setShowFileBrowser);
+	const setShowGitDiff = useFileStore((s) => s.setShowGitDiff);
 
 	// Show auth screen if not authenticated
 	if (connectionState !== "authenticated") {
@@ -56,6 +64,53 @@ function App() {
 							Session: {currentSessionId.slice(0, 8)}...
 						</span>
 					)}
+					<div className="flex-1" />
+					{/* File Browser button */}
+					<button
+						type="button"
+						onClick={() => setShowFileBrowser(true)}
+						className="p-2 text-gray-400 hover:text-white rounded-lg hover:bg-gray-700"
+						title="File Browser"
+					>
+						<svg
+							className="w-5 h-5"
+							fill="none"
+							stroke="currentColor"
+							viewBox="0 0 24 24"
+							aria-hidden="true"
+						>
+							<title>Files</title>
+							<path
+								strokeLinecap="round"
+								strokeLinejoin="round"
+								strokeWidth={2}
+								d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
+							/>
+						</svg>
+					</button>
+					{/* Git Diff button */}
+					<button
+						type="button"
+						onClick={() => setShowGitDiff(true)}
+						className="p-2 text-gray-400 hover:text-white rounded-lg hover:bg-gray-700"
+						title="Git Changes"
+					>
+						<svg
+							className="w-5 h-5"
+							fill="none"
+							stroke="currentColor"
+							viewBox="0 0 24 24"
+							aria-hidden="true"
+						>
+							<title>Git</title>
+							<path
+								strokeLinecap="round"
+								strokeLinejoin="round"
+								strokeWidth={2}
+								d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"
+							/>
+						</svg>
+					</button>
 				</header>
 
 				{/* Chat area */}
@@ -67,6 +122,38 @@ function App() {
 			{/* Dialogs */}
 			<PermissionDialog />
 			<QuestionDialog />
+
+			{/* File Browser Panel */}
+			{showFileBrowser && (
+				<div className="fixed inset-0 z-40 md:inset-auto md:right-0 md:top-0 md:bottom-0 md:w-96">
+					<button
+						type="button"
+						className="absolute inset-0 bg-black/50 md:hidden cursor-default"
+						onClick={() => setShowFileBrowser(false)}
+						onKeyDown={(e) => e.key === "Escape" && setShowFileBrowser(false)}
+						aria-label="Close file browser"
+					/>
+					<div className="absolute inset-y-0 right-0 w-full max-w-sm md:max-w-none md:w-96 bg-gray-900 shadow-xl">
+						<FileBrowser />
+					</div>
+				</div>
+			)}
+
+			{/* Git Diff Panel */}
+			{showGitDiff && (
+				<div className="fixed inset-0 z-40 md:inset-auto md:right-0 md:top-0 md:bottom-0 md:w-96">
+					<button
+						type="button"
+						className="absolute inset-0 bg-black/50 md:hidden cursor-default"
+						onClick={() => setShowGitDiff(false)}
+						onKeyDown={(e) => e.key === "Escape" && setShowGitDiff(false)}
+						aria-label="Close git diff viewer"
+					/>
+					<div className="absolute inset-y-0 right-0 w-full max-w-sm md:max-w-none md:w-96 bg-gray-900 shadow-xl">
+						<GitDiffViewer />
+					</div>
+				</div>
+			)}
 
 			{/* Error toast */}
 			{error && (

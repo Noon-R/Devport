@@ -5,8 +5,11 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"log"
+	"time"
 
 	"github.com/Noon-R/Devport/server/agent"
+	"github.com/Noon-R/Devport/server/session"
+	"github.com/google/uuid"
 )
 
 // JSON-RPC 2.0 structures
@@ -128,6 +131,12 @@ func (h *Handler) handleChatAttach(ctx context.Context, state *ConnState, req *J
 		return errorResponse(req.ID, ErrCodeInvalidParams, "Invalid params")
 	}
 
+	// Check if session exists
+	sess := h.sessionStore.Get(params.SessionID)
+	if sess == nil {
+		return errorResponse(req.ID, ErrCodeSessionNotFound, "Session not found")
+	}
+
 	// Get or create agent for this session
 	_, err := h.processManager.GetOrCreate(ctx, params.SessionID)
 	if err != nil {
@@ -135,9 +144,14 @@ func (h *Handler) handleChatAttach(ctx context.Context, state *ConnState, req *J
 	}
 
 	state.sessionID = params.SessionID
+
+	// Get history for this session
+	history := h.sessionStore.GetHistory(params.SessionID)
+
 	return successResponse(req.ID, map[string]interface{}{
 		"session_id": params.SessionID,
 		"status":     "attached",
+		"history":    history,
 	})
 }
 
@@ -156,6 +170,22 @@ func (h *Handler) handleChatMessage(ctx context.Context, state *ConnState, req *
 	if err != nil {
 		return errorResponse(req.ID, ErrCodeInternal, err.Error())
 	}
+
+	// Save user message to history
+	userMsg := session.HistoryMessage{
+		ID:        uuid.New().String(),
+		Role:      "user",
+		Content:   params.Content,
+		Timestamp: time.Now(),
+	}
+	h.sessionStore.AddMessage(params.SessionID, userMsg)
+
+	// Initialize assistant message tracking
+	state.mu.Lock()
+	state.currentAssistantMsgID = uuid.New().String()
+	state.currentAssistantContent = ""
+	state.currentAssistantTools = nil
+	state.mu.Unlock()
 
 	// Send message and stream events
 	go func() {
@@ -253,17 +283,40 @@ func (h *Handler) sendEventNotification(ctx context.Context, state *ConnState, s
 	case agent.EventTypeText:
 		method = "chat.text"
 		params["content"] = event.Content
+		// Track assistant content
+		state.mu.Lock()
+		state.currentAssistantContent += event.Content
+		state.mu.Unlock()
 
 	case agent.EventTypeToolCall:
 		method = "chat.tool_call"
 		params["tool_use_id"] = event.ToolUseID
 		params["tool_name"] = event.ToolName
 		params["input"] = event.ToolInput
+		// Track tool call
+		state.mu.Lock()
+		state.currentAssistantTools = append(state.currentAssistantTools, ToolCallState{
+			ID:     event.ToolUseID,
+			Name:   event.ToolName,
+			Input:  event.ToolInput,
+			Status: "pending",
+		})
+		state.mu.Unlock()
 
 	case agent.EventTypeToolResult:
 		method = "chat.tool_result"
 		params["tool_use_id"] = event.ToolUseID
 		params["output"] = event.ToolOutput
+		// Update tool call status
+		state.mu.Lock()
+		for i := range state.currentAssistantTools {
+			if state.currentAssistantTools[i].ID == event.ToolUseID {
+				state.currentAssistantTools[i].Output = event.ToolOutput
+				state.currentAssistantTools[i].Status = "completed"
+				break
+			}
+		}
+		state.mu.Unlock()
 
 	case agent.EventTypePermissionRequest:
 		method = "chat.permission_request"
@@ -279,6 +332,33 @@ func (h *Handler) sendEventNotification(ctx context.Context, state *ConnState, s
 
 	case agent.EventTypeDone:
 		method = "chat.done"
+		// Save assistant message to history
+		state.mu.Lock()
+		if state.currentAssistantMsgID != "" {
+			toolCalls := make([]session.ToolCallInfo, len(state.currentAssistantTools))
+			for i, tc := range state.currentAssistantTools {
+				toolCalls[i] = session.ToolCallInfo{
+					ID:     tc.ID,
+					Name:   tc.Name,
+					Input:  tc.Input,
+					Output: tc.Output,
+					Status: tc.Status,
+				}
+			}
+			assistantMsg := session.HistoryMessage{
+				ID:        state.currentAssistantMsgID,
+				Role:      "assistant",
+				Content:   state.currentAssistantContent,
+				ToolCalls: toolCalls,
+				Timestamp: time.Now(),
+			}
+			h.sessionStore.AddMessage(sessionID, assistantMsg)
+			// Reset tracking
+			state.currentAssistantMsgID = ""
+			state.currentAssistantContent = ""
+			state.currentAssistantTools = nil
+		}
+		state.mu.Unlock()
 
 	case agent.EventTypeError:
 		method = "chat.error"
@@ -287,9 +367,44 @@ func (h *Handler) sendEventNotification(ctx context.Context, state *ConnState, s
 	case agent.EventTypeSystem:
 		method = "chat.system"
 		params["message"] = event.Content
+		// Save system message to history
+		sysMsg := session.HistoryMessage{
+			ID:        uuid.New().String(),
+			Role:      "system",
+			Content:   event.Content,
+			Timestamp: time.Now(),
+		}
+		h.sessionStore.AddMessage(sessionID, sysMsg)
 
 	case agent.EventTypeInterrupted:
 		method = "chat.interrupted"
+		// Save partial assistant message if any
+		state.mu.Lock()
+		if state.currentAssistantMsgID != "" && (state.currentAssistantContent != "" || len(state.currentAssistantTools) > 0) {
+			toolCalls := make([]session.ToolCallInfo, len(state.currentAssistantTools))
+			for i, tc := range state.currentAssistantTools {
+				toolCalls[i] = session.ToolCallInfo{
+					ID:     tc.ID,
+					Name:   tc.Name,
+					Input:  tc.Input,
+					Output: tc.Output,
+					Status: tc.Status,
+				}
+			}
+			assistantMsg := session.HistoryMessage{
+				ID:        state.currentAssistantMsgID,
+				Role:      "assistant",
+				Content:   state.currentAssistantContent,
+				ToolCalls: toolCalls,
+				Timestamp: time.Now(),
+			}
+			h.sessionStore.AddMessage(sessionID, assistantMsg)
+		}
+		// Reset tracking
+		state.currentAssistantMsgID = ""
+		state.currentAssistantContent = ""
+		state.currentAssistantTools = nil
+		state.mu.Unlock()
 
 	default:
 		return

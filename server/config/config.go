@@ -11,6 +11,12 @@ type Config struct {
 	DataDir    string
 	DevMode    bool
 	LogLevel   string
+
+	// Relay settings
+	RelayEnabled bool
+	RelayURL     string
+	RelayToken   string
+	Subdomain    string
 }
 
 func Load() *Config {
@@ -21,6 +27,12 @@ func Load() *Config {
 		DataDir:    getEnv("DATA_DIR", ".devport"),
 		DevMode:    getEnv("DEV_MODE", "false") == "true",
 		LogLevel:   getEnv("LOG_LEVEL", "info"),
+
+		// Relay settings
+		RelayEnabled: getEnv("RELAY_ENABLED", "true") == "true",
+		RelayURL:     getEnv("RELAY_URL", "https://cloud.devport.app"),
+		RelayToken:   getEnv("RELAY_TOKEN", ""),
+		Subdomain:    getEnv("SUBDOMAIN", ""),
 	}
 }
 

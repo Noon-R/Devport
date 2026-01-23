@@ -22,10 +22,21 @@ type Handler struct {
 }
 
 type ConnState struct {
-	conn          *websocket.Conn
-	authenticated bool
-	sessionID     string
-	mu            sync.Mutex
+	conn                     *websocket.Conn
+	authenticated            bool
+	sessionID                string
+	mu                       sync.Mutex
+	currentAssistantContent  string
+	currentAssistantTools    []ToolCallState
+	currentAssistantMsgID    string
+}
+
+type ToolCallState struct {
+	ID     string
+	Name   string
+	Input  map[string]interface{}
+	Output string
+	Status string
 }
 
 func NewHandler(cfg *config.Config) *Handler {
@@ -34,6 +45,25 @@ func NewHandler(cfg *config.Config) *Handler {
 		sessionStore:   session.NewStore(cfg.WorkDir),
 		processManager: process.NewManager(cfg.WorkDir, 10*time.Minute),
 	}
+}
+
+// NewHandlerWithDeps creates a handler with external dependencies
+func NewHandlerWithDeps(cfg *config.Config, sessionStore *session.Store, processManager *process.Manager) *Handler {
+	return &Handler{
+		cfg:            cfg,
+		sessionStore:   sessionStore,
+		processManager: processManager,
+	}
+}
+
+// GetSessionStore returns the session store
+func (h *Handler) GetSessionStore() *session.Store {
+	return h.sessionStore
+}
+
+// GetProcessManager returns the process manager
+func (h *Handler) GetProcessManager() *process.Manager {
+	return h.processManager
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
